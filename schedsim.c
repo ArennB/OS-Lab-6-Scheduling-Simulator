@@ -1,256 +1,355 @@
-// C program for implementation of Simulation 
-#include<stdio.h> 
-#include<limits.h>
-#include<stdlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
 #include "process.h"
 #include "util.h"
 
+/*
+ * Assumptions:
+ *  - ProcessType has fields: pid, bt, art, wt, tat, pri
+ *  - initProc(const char *filename, int *n) returns a malloc'd array of ProcessType
+ *    and sets *n to the number of processes.
+ *  - printMetrics(ProcessType *plist, int n) prints the per-process and average metrics.
+ *
+ * This file implements:
+ *  - FCFS (arrival-aware; sorts by arrival time)
+ *  - Priority (stable behavior by breaking ties using arrival time and pid)
+ *  - SRTF (preemptive SJF; checks arrivals at every time unit)
+ *  - Round Robin (arrival-aware; advances time to next arrival if CPU idle)
+ *
+ * It also frees proc_list after each scheduling run to avoid leaks.
+ */
 
-// Function to find the waiting time for all  
-// processes
-void findWaitingTimeRR(ProcessType plist[], int n, int quantum)
-{
-    int rem_bt[n];
-    for (int i = 0; i < n; i++)
-        rem_bt[i] = plist[i].bt;  // copy burst times
+/* -----------------------
+   Helper qsort comparators
+   ----------------------- */
 
-    int t = 0;  // current time
+/* FCFS comparator: sort by arrival time, then pid (keeps original input order for ties) */
+int compareArrivalThenPid(const void *a, const void *b) {
+    const ProcessType *p1 = (const ProcessType *)a;
+    const ProcessType *p2 = (const ProcessType *)b;
 
-    // Continue until all processes are done
-    while (1) {
-        int done = 1;
-        for (int i = 0; i < n; i++) {
-            if (rem_bt[i] > 0) {
-                done = 0; // There is a pending process
+    if (p1->art < p2->art) return -1;
+    if (p1->art > p2->art) return 1;
+    /* tie-break with pid so input order is preserved if pid corresponds to input order */
+    return p1->pid - p2->pid;
+}
 
-                if (rem_bt[i] > quantum) {
-                    t += quantum;
-                    rem_bt[i] -= quantum;
-                } else {
-                    // Last cycle for this process
-                    t += rem_bt[i];
-                    plist[i].wt = t - plist[i].bt;
-                    rem_bt[i] = 0;
-                }
-            }
+/* Priority comparator: primary = priority (lower value = higher priority),
+   secondary = arrival time (earlier arrival first),
+   tertiary = pid (preserve input order).
+   This ensures FCFS among equal priorities. */
+int comparePriorityStable(const void *a, const void *b) {
+    const ProcessType *p1 = (const ProcessType *)a;
+    const ProcessType *p2 = (const ProcessType *)b;
+
+    if (p1->pri < p2->pri) return -1;
+    if (p1->pri > p2->pri) return 1;
+
+    if (p1->art < p2->art) return -1;
+    if (p1->art > p2->art) return 1;
+
+    return p1->pid - p2->pid;
+}
+
+/* -----------------------
+   FCFS scheduling
+   ----------------------- */
+
+/* Compute waiting times for FCFS when arrival times may be arbitrary.
+   We sort by arrival time and then compute service_time cumulatively.
+   This implementation assumes we can reorder ready queue by arrival time
+   (which FCFS semantics require). */
+void findWaitingTimeFCFS(ProcessType plist[], int n) {
+    if (n <= 0) return;
+
+    /* Sort by arrival so FCFS processes are in the correct order */
+    qsort(plist, n, sizeof(ProcessType), compareArrivalThenPid);
+
+    int service_time = 0;
+    for (int i = 0; i < n; i++) {
+        /* If the CPU is idle until this process arrives, advance service_time */
+        if (service_time < plist[i].art) {
+            service_time = plist[i].art;
         }
 
-        if (done == 1)
-            break;
+        plist[i].wt = service_time - plist[i].art;
+        if (plist[i].wt < 0) plist[i].wt = 0;
+
+        /* process runs to completion */
+        service_time += plist[i].bt;
     }
 }
 
-// Function to find the waiting time for all  
-// processes 
-// Function to find the waiting time for all processes (SJF - Non-preemptive)
-void findWaitingTimeSJF(ProcessType plist[], int n)
-{
-    int completed[n];
+void findavgTimeFCFS(ProcessType plist[], int n) {
+    findWaitingTimeFCFS(plist, n);
+    for (int i = 0; i < n; i++) {
+        plist[i].tat = plist[i].wt + plist[i].bt;
+    }
+}
+
+/* -----------------------
+   Priority scheduling (non-preemptive)
+   ----------------------- */
+
+/* Use a stable approach via comparator tie-breakers (priority -> arrival -> pid). */
+void findavgTimePriority(ProcessType plist[], int n) {
+    if (n <= 0) return;
+
+    qsort(plist, n, sizeof(ProcessType), comparePriorityStable);
+
+    /* After sorting by priority (and tiebreakers), use FCFS semantics */
+    /* Reuse the FCFS logic, but since we've already sorted by priority + arrival,
+       we can compute waiting times similarly to FCFS but without re-sorting. */
+    int service_time = 0;
+    for (int i = 0; i < n; i++) {
+        if (service_time < plist[i].art)
+            service_time = plist[i].art;
+
+        plist[i].wt = service_time - plist[i].art;
+        if (plist[i].wt < 0) plist[i].wt = 0;
+
+        service_time += plist[i].bt;
+    }
+
     for (int i = 0; i < n; i++)
-        completed[i] = 0;  // mark all as incomplete
+        plist[i].tat = plist[i].wt + plist[i].bt;
+}
 
-    int complete = 0, t = 0, min_bt, shortest = 0, check = 0;
+/* -----------------------
+   SRTF (preemptive SJF)
+   ----------------------- */
 
-    while (complete != n) {
-        min_bt = INT_MAX;
-        for (int j = 0; j < n; j++) {
-            if ((plist[j].art <= t) && (completed[j] == 0) && (plist[j].bt < min_bt)) {
-                min_bt = plist[j].bt;
-                shortest = j;
-                check = 1;
+/*
+ * Preemptive SJF (Shortest Remaining Time First).
+ * This algorithm iterates time t = 0,1,2,... until all processes complete.
+ * At each time unit it selects the arrived process with the smallest remaining time.
+ * It executes that process for 1 time unit (so new arrivals can preempt).
+ */
+void findWaitingTimeSJF(ProcessType plist[], int n) {
+    if (n <= 0) return;
+
+    int *rt = (int *)malloc(sizeof(int) * n);
+    if (!rt) {
+        fprintf(stderr, "Memory allocation failed in findWaitingTimeSJF\n");
+        exit(1);
+    }
+
+    for (int i = 0; i < n; i++)
+        rt[i] = plist[i].bt;
+
+    int completed = 0;
+    int t = 0;
+
+    /* To handle arbitrary arrival times, we do not sort plist here; we check arrival in loop */
+    while (completed < n) {
+        int idx_shortest = -1;
+        int min_rem = INT_MAX;
+
+        /* find arrived process with minimal remaining time */
+        for (int i = 0; i < n; i++) {
+            if (plist[i].art <= t && rt[i] > 0 && rt[i] < min_rem) {
+                min_rem = rt[i];
+                idx_shortest = i;
             }
         }
 
-        if (check == 0) {
-            t++;
+        if (idx_shortest == -1) {
+            /* No process has arrived yet or all arrived ones are complete -> advance time to next arrival */
+            int earliest_future = INT_MAX;
+            for (int i = 0; i < n; i++) {
+                if (rt[i] > 0 && plist[i].art > t) {
+                    if (plist[i].art < earliest_future)
+                        earliest_future = plist[i].art;
+                }
+            }
+            if (earliest_future != INT_MAX)
+                t = earliest_future;
+            else
+                break; /* should not happen but defensive */
             continue;
         }
 
-        t += plist[shortest].bt;
-        plist[shortest].wt = t - plist[shortest].bt - plist[shortest].art;
-        if (plist[shortest].wt < 0)
-            plist[shortest].wt = 0;
+        /* execute for 1 time unit */
+        rt[idx_shortest]--;
+        t++;
 
-        completed[shortest] = 1;
-        complete++;
-        check = 0;
+        /* if finished, mark completion */
+        if (rt[idx_shortest] == 0) {
+            completed++;
+            int finish_time = t;
+            plist[idx_shortest].wt = finish_time - plist[idx_shortest].bt - plist[idx_shortest].art;
+            if (plist[idx_shortest].wt < 0) plist[idx_shortest].wt = 0;
+        }
+        /* loop continues; new arrivals at time t may preempt on next step */
     }
+
+    free(rt);
 }
 
-// Function to find the waiting time for all  
-// processes 
-void findWaitingTime(ProcessType plist[], int n)
-{ 
-    // waiting time for first process is 0, or the arrival time if not 
-    plist[0].wt = 0 +  plist[0].art; 
-  
-    // calculating waiting time 
-    for (int  i = 1; i < n ; i++ ) 
-        plist[i].wt =  plist[i-1].bt + plist[i-1].wt; 
-} 
-  
-// Function to calculate turn around time 
-void findTurnAroundTime( ProcessType plist[], int n)
-{ 
-    // calculating turnaround time by adding bt[i] + wt[i] 
-    for (int  i = 0; i < n ; i++) 
-        plist[i].tat = plist[i].bt + plist[i].wt; 
-} 
-  
-// Function to sort the Process acc. to priority
-int my_comparer(const void *this, const void *that)
-{
-    const ProcessType *p1 = (const ProcessType *)this;
-    const ProcessType *p2 = (const ProcessType *)that;
-
-    // Higher priority value should come first
-    if (p1->pri > p2->pri)
-        return -1;
-    else if (p1->pri < p2->pri)
-        return 1;
-    else
-        // Tie-break by PID (smaller PID goes first)
-        return p1->pid - p2->pid;
+/* wrapper to compute tat after waiting times */
+void findavgTimeSJF(ProcessType plist[], int n) {
+    findWaitingTimeSJF(plist, n);
+    for (int i = 0; i < n; i++)
+        plist[i].tat = plist[i].wt + plist[i].bt;
 }
 
+/* -----------------------
+   Round Robin (arrival-aware)
+   ----------------------- */
 
-//Function to calculate average time 
-void findavgTimeFCFS( ProcessType plist[], int n) 
-{ 
-    //Function to find waiting time of all processes 
-    findWaitingTime(plist, n); 
-  
-    //Function to find turn around time for all processes 
-    findTurnAroundTime(plist, n); 
-  
-    //Display processes along with all details 
-    printf("\n*********\nFCFS\n");
+/*
+ * Arrival-aware RR:
+ * - We maintain rem_bt[] as remaining burst times.
+ * - We scan processes in circular order starting from last_index to find the next eligible
+ *   (arrived and rem_bt > 0) process to run.
+ * - If no process has arrived yet but some processes are still pending (future arrivals),
+ *   we advance time to the earliest next arrival.
+ * - When a process finishes we compute its waiting time:
+ *     wt = finish_time - bt - art
+ *
+ * This approach avoids assuming all art == 0.
+ */
+void findWaitingTimeRR(ProcessType plist[], int n, int quantum) {
+    if (n <= 0) return;
+    if (quantum <= 0) quantum = 1;
+
+    int *rem_bt = (int *)malloc(sizeof(int) * n);
+    if (!rem_bt) {
+        fprintf(stderr, "Memory allocation failed in findWaitingTimeRR\n");
+        exit(1);
+    }
+    int remaining = n;
+
+    for (int i = 0; i < n; i++) {
+        rem_bt[i] = plist[i].bt;
+        plist[i].wt = 0; /* initialize */
+    }
+
+    int t = 0;
+    int last_idx = -1; /* start scanning at 0 on first iteration */
+
+    while (remaining > 0) {
+        int found = 0;
+        int start = (last_idx + 1) % n;
+
+        /* circular scan once to find a ready process */
+        for (int i = 0; i < n; i++) {
+            int idx = (start + i) % n;
+            if (rem_bt[idx] > 0 && plist[idx].art <= t) {
+                /* this process is ready; run it */
+                found = 1;
+                last_idx = idx;
+
+                if (rem_bt[idx] > quantum) {
+                    rem_bt[idx] -= quantum;
+                    t += quantum;
+                } else {
+                    /* last slice for this process */
+                    t += rem_bt[idx];
+                    rem_bt[idx] = 0;
+                    remaining--;
+
+                    plist[idx].wt = t - plist[idx].bt - plist[idx].art;
+                    if (plist[idx].wt < 0) plist[idx].wt = 0;
+                }
+
+                /* after a run, break so RR fairness (next round) continues scanning from next process */
+                break;
+            }
+        }
+
+        if (!found) {
+            /* No ready process found at current time t.
+               If there are still unfinished processes, advance time to the earliest arrival
+               of the remaining processes (to avoid busy-waiting). */
+            int earliest_future = INT_MAX;
+            for (int i = 0; i < n; i++) {
+                if (rem_bt[i] > 0 && plist[i].art > t) {
+                    if (plist[i].art < earliest_future)
+                        earliest_future = plist[i].art;
+                }
+            }
+
+            if (earliest_future == INT_MAX) {
+                /* No future arrivals (shouldn't happen if remaining>0), but break defensively */
+                break;
+            } else {
+                t = earliest_future;
+            }
+        }
+    }
+
+    free(rem_bt);
 }
 
-//Function to calculate average time 
-void findavgTimeSJF( ProcessType plist[], int n) 
-{ 
-    //Function to find waiting time of all processes 
-    findWaitingTimeSJF(plist, n); 
-  
-    //Function to find turn around time for all processes 
-    findTurnAroundTime(plist, n); 
-  
-    //Display processes along with all details 
-    printf("\n*********\nSJF\n");
+void findavgTimeRR(ProcessType plist[], int n, int quantum) {
+    findWaitingTimeRR(plist, n, quantum);
+    for (int i = 0; i < n; i++)
+        plist[i].tat = plist[i].wt + plist[i].bt;
 }
 
-//Function to calculate average time 
-void findavgTimeRR( ProcessType plist[], int n, int quantum) 
-{ 
-    //Function to find waiting time of all processes 
-    findWaitingTimeRR(plist, n, quantum); 
-  
-    //Function to find turn around time for all processes 
-    findTurnAroundTime(plist, n); 
-  
-    //Display processes along with all details 
-    printf("\n*********\nRR Quantum = %d\n", quantum);
-}
-
-//Function to calculate average time 
-void findavgTimePriority(ProcessType plist[], int n)
-{
-    // Sort processes by priority
-    qsort(plist, n, sizeof(ProcessType), my_comparer);
-
-    // Apply FCFS logic to the sorted list
-    findWaitingTime(plist, n);
-    findTurnAroundTime(plist, n);
-
-    printf("\n*********\nPriority\n");
-}
-
-
-void printMetrics(ProcessType plist[], int n)
-{
-    int total_wt = 0, total_tat = 0; 
-    float awt, att;
-    
-    printf("\tProcesses\tBurst time\tWaiting time\tTurn around time\n"); 
-  
-    // Calculate total waiting time and total turn  
-    // around time 
-    for (int  i=0; i<n; i++) 
-    { 
-        total_wt = total_wt + plist[i].wt; 
-        total_tat = total_tat + plist[i].tat; 
-        printf("\t%d\t\t%d\t\t%d\t\t%d\n", plist[i].pid, plist[i].bt, plist[i].wt, plist[i].tat); 
-    } 
-  
-    awt = ((float)total_wt / (float)n);
-    att = ((float)total_tat / (float)n);
-    
-    printf("\nAverage waiting time = %.2f", awt); 
-    printf("\nAverage turn around time = %.2f\n", att); 
-} 
-
-ProcessType * initProc(char *filename, int *n) 
-{
-  	FILE *input_file = fopen(filename, "r");
-	  if (!input_file) {
-		    fprintf(stderr, "Error: Invalid filepath\n");
-		    fflush(stdout);
-		    exit(0);
-	  }
-
-    ProcessType *plist = parse_file(input_file, n);
-  
-    fclose(input_file);
-  
-    return plist;
-}
-  
-// Driver code 
-int main(int argc, char *argv[]) 
-{ 
-    int n; 
-    int quantum = 2;
-
-    ProcessType *proc_list;
-  
+/* -----------------------
+   Main
+   ----------------------- */
+int main(int argc, char *argv[]) {
     if (argc < 2) {
-		   fprintf(stderr, "Usage: ./schedsim <input-file-path>\n");
-		   fflush(stdout);
-		   return 1;
-	   }
-    
-  // FCFS
-    n = 0;
+        fprintf(stderr, "Usage: %s <inputfile> [quantum]\n", argv[0]);
+        return 1;
+    }
+
+    int quantum = 2; /* default */
+    if (argc >= 3) {
+        int q = atoi(argv[2]);
+        if (q > 0) quantum = q;
+    }
+
+    int n = 0;
+    ProcessType *proc_list = NULL;
+
+    /* ------ FCFS ------ */
     proc_list = initProc(argv[1], &n);
-  
+    if (!proc_list) {
+        fprintf(stderr, "initProc failed or returned NULL for FCFS\n");
+        return 1;
+    }
     findavgTimeFCFS(proc_list, n);
-    
     printMetrics(proc_list, n);
-  
-  // SJF
-    n = 0;
+    free(proc_list);
+    proc_list = NULL;
+
+    /* ------ SRTF (preemptive SJF) ------ */
     proc_list = initProc(argv[1], &n);
-   
-    findavgTimeSJF(proc_list, n); 
-   
+    if (!proc_list) {
+        fprintf(stderr, "initProc failed or returned NULL for SRTF\n");
+        return 1;
+    }
+    findavgTimeSJF(proc_list, n);
     printMetrics(proc_list, n);
-  
-  // Priority
-    n = 0; 
+    free(proc_list);
+    proc_list = NULL;
+
+    /* ------ PRIORITY ------ */
     proc_list = initProc(argv[1], &n);
-    
-    findavgTimePriority(proc_list, n); 
-    
+    if (!proc_list) {
+        fprintf(stderr, "initProc failed or returned NULL for Priority\n");
+        return 1;
+    }
+    findavgTimePriority(proc_list, n);
     printMetrics(proc_list, n);
-    
-  // RR
-    n = 0;
+    free(proc_list);
+    proc_list = NULL;
+
+    /* ------ ROUND ROBIN ------ */
     proc_list = initProc(argv[1], &n);
-    
-    findavgTimeRR(proc_list, n, quantum); 
-    
+    if (!proc_list) {
+        fprintf(stderr, "initProc failed or returned NULL for RR\n");
+        return 1;
+    }
+    findavgTimeRR(proc_list, n, quantum);
     printMetrics(proc_list, n);
-    
-    return 0; 
-} 
+    free(proc_list);
+    proc_list = NULL;
+
+    return 0;
+}
